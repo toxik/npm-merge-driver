@@ -6,6 +6,10 @@ const fs = require('fs')
 const mkdirp = require('mkdirp')
 const path = require('path')
 const yargs = require('yargs')
+const libxml = require('libxmljs')
+const differenceBy = require('lodash/differenceBy')
+const intersectionBy = require('lodash/intersectionBy')
+const mapKeys = require('lodash/mapKeys')
 
 if (require.main === module) {
   parseArgs()
@@ -17,12 +21,6 @@ function parseArgs () {
       'install',
       'Set up the merge driver in the current git repository.',
     {
-      legacy: {
-        type: 'boolean',
-        default: true,
-        description:
-            'when the merge driver errors, it will retry the command after resolving the merge conflict with --theirs'
-      },
       global: {
         type: 'boolean',
         default: false,
@@ -30,20 +28,20 @@ function parseArgs () {
       },
       driver: {
         type: 'string',
-        default: 'npx npm-merge-driver merge %A %O %B %P',
+        default: 'npx resx-git-merge-driver merge %A %O %B %P',
         description:
             'string to install as the driver in the git configuration'
       },
       'driver-name': {
         type: 'string',
-        default: 'npm-merge-driver',
+        default: 'resx-git-merge-driver',
         description:
             'String to use as the merge driver name in your configuration.'
       },
       files: {
         description: 'Filenames that will trigger this driver.',
         type: 'array',
-        default: ['npm-shrinkwrap.json', 'package-lock.json']
+        default: ['*.resx']
       }
     },
       install
@@ -59,7 +57,7 @@ function parseArgs () {
       },
       'driver-name': {
         type: 'string',
-        default: 'npm-merge-driver',
+        default: 'resx-git-merge-driver',
         description:
             'String to use as the merge driver name in your configuration.'
       }
@@ -68,28 +66,20 @@ function parseArgs () {
     )
     .command(
       'merge <%A> <%O> <%B> <%P>',
-      'Check for lockfile conflicts and correct them if necessary.',
+      'Check for resx conflicts and correct them if necessary.',
     {
-      command: {
-        alias: 'c',
-        description: 'Command to execute to resolve conflicts.',
-        type: 'string',
-        default: 'npm install --package-lock-only'
-      },
       legacy: {
         type: 'boolean',
-        default: true,
+        default: false,
         description:
             'If <command> errors, it will be re-run after checking out the --theirs version of the file, with no granular merging.'
       }
     },
       merge
     )
-    .version(require('./package.json').version)
     .alias('version', 'v')
     .help()
     .alias('help', 'h')
-    .epilogue('For the full documentation, see npm-merge-driver(1)')
     .demandCommand().argv
 }
 
@@ -100,12 +90,10 @@ function install (argv) {
   )
   const opts = argv.global ? '--global' : '--local'
   cp.execSync(
-    `git config ${opts} merge."${argv.driverName}".name "automatically merge npm lockfiles"`
+    `git config ${opts} merge."${argv.driverName}".name "automatically merge .resx files"`
   )
   cp.execSync(
-    `git config ${opts} merge."${argv.driverName}".driver "${argv.driver}${!argv.legacy
-      ? ' --no-legacy'
-      : ''}"`
+    `git config ${opts} merge."${argv.driverName}".driver "${argv.driver}"`
   )
   mkdirp.sync(path.dirname(attrFile))
   let attrContents = ''
@@ -126,7 +114,7 @@ function install (argv) {
   attrContents += '\n'
   fs.writeFileSync(attrFile, attrContents)
   console.error(
-    'npm-merge-driver:',
+    'resx-git-merge-driver:',
     argv.driverName,
     'installed to `git config',
     opts + '`',
@@ -191,34 +179,96 @@ function findAttributes (argv) {
 }
 
 function merge (argv) {
-  console.error('npm-merge-driver: merging', argv['%P'])
+  console.error('resx-git-merge-driver: merging', argv['%P'])
+  // let git handle the merge normally
   const ret = cp.spawnSync(
     'git',
-    ['merge-file', '-p', argv['%A'], argv['%O'], argv['%B']],
+    [
+      'merge-file',
+      '-p',
+      '-L HEAD',
+      '-L INCOMING',
+      '--union',
+      argv['%A'],
+      argv['%O'],
+      argv['%B']
+    ],
     {
       stdio: [0, 'pipe', 2]
     }
   )
   fs.writeFileSync(argv['%P'], ret.stdout)
+
   try {
-    cp.execSync(argv.command, {
-      stdio: 'inherit',
-      cwd: path.dirname(argv['%P'])
-    })
+    // see if the resulting file  has markers
+    const result = ret.stdout.toString('utf8')
+    // also check if it's correct XML (will throw if not)
+    libxml.parseXmlString(result)
   } catch (e) {
-    if (!argv.legacy) {
-      throw e
-    }
-    fs.writeFileSync(argv['%P'], fs.readFileSync(argv['%B']))
-    console.error(
-      'npm-merge-driver: --legacy enabled. Checking out --theirs and retrying merge.'
+    // let's try and do the merge manually then
+    const left = libxml.parseXmlString(fs.readFileSync(argv['%A'], 'utf8'))
+    const right = libxml.parseXmlString(fs.readFileSync(argv['%B'], 'utf8'))
+
+    // so first of all we want to add any new nodes to A from B,
+    const leftNames = left
+      .root()
+      .childNodes()
+      .filter(node => node.type() === 'element' && node.name() === 'data')
+      .map(node => ({
+        name: node.attr('name').value(),
+        path: node.path(),
+        value: node.text()
+      }))
+    const rightNames = right
+      .root()
+      .childNodes()
+      .filter(node => node.type() === 'element' && node.name() === 'data')
+      .map(node => ({
+        name: node.attr('name').value(),
+        path: node.path(),
+        value: node.text()
+      }))
+
+    // any value changes ?
+    const rightNamesMap = mapKeys(rightNames, 'name')
+    const commonNames = intersectionBy(leftNames, rightNames, el => el.name)
+    const differentValues = commonNames.filter(
+      node => node.value !== rightNamesMap[node.name].value
     )
-    console.error('npm-merge-driver: !!!SOME CHANGES MAY BE LOST!!!')
-    cp.execSync(argv.command, {
-      stdio: 'inherit',
-      cwd: path.dirname(argv['%P'])
+
+    if (differentValues.length !== 0) {
+      console.error(
+        'there are conflicts that need resolving manually on:',
+        argv['%P']
+      )
+      const ret = cp.spawnSync(
+        'git',
+        [
+          'merge-file',
+          '-p',
+          '-L HEAD',
+          '-L INCOMING',
+          argv['%A'],
+          argv['%O'],
+          argv['%B']
+        ],
+        {
+          stdio: [0, 'pipe', 2]
+        }
+      )
+      fs.writeFileSync(argv['%A'], ret.stdout)
+      process.exit(-1)
+    }
+
+    const newNodeNames = differenceBy(rightNames, leftNames, el => el.name)
+    // add in left what's not in right
+    newNodeNames.forEach((node, idx) => {
+      left.root().addChild(right.get(node.path))
     })
+
+    // merge complete :)
+    ret.stdout = left.toString()
   }
-  fs.writeFileSync(argv['%A'], fs.readFileSync(argv['%P']))
-  console.error('npm-merge-driver:', argv['%P'], 'successfully merged.')
+  fs.writeFileSync(argv['%A'], ret.stdout)
+  console.error('resx-git-merge-driver:', argv['%P'], 'successfully merged.')
 }
